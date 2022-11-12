@@ -7,7 +7,8 @@ Inspired by [this Blogpost](https://igauravsehrawat.com/build-your-own-ngrok-4-e
 - Opens an SSH Tunnel to your server and forwards the necessary ports
   - Supports custom connect-commands (for port-knocking etc)
 - Provides a (local) webserver to serve your files over the tunnel
-- Dynamically adds/removes users from .htaccess for (optional) secure sharing
+- Allow to protect content with password (http basic_auth?)
+    (- Dynamically adds/removes users from .htaccess)?
 
 -------------------
 
