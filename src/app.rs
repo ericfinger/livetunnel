@@ -1,25 +1,34 @@
 use crate::Cli;
 
 use confy::{get_configuration_file_path, load, store};
-use indicatif::ProgressBar;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::{
     validator::{Validation, ValueRequiredValidator},
     Confirm, CustomType, Editor, MultiSelect, Text,
 };
-use openssh::{Session, SessionBuilder};
+use lazy_static::lazy_static;
+use openssh::{Session, SessionBuilder, Socket::TcpSocket};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 use std::{
     env::current_dir,
     fmt::{Display, Formatter, Result},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    process::Command,
+    process::{exit, Command},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    thread::sleep,
+    time::Duration,
 };
+
+lazy_static! {
+    static ref WARNING_TEMPLATE: ProgressStyle = ProgressStyle::with_template("❗{msg}").unwrap();
+    static ref SUCCESS_TEMPLATE: ProgressStyle = ProgressStyle::with_template("✓ {msg}").unwrap();
+}
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 struct Config {
@@ -92,7 +101,7 @@ impl App {
                 dir
             } else {
                 println!("❗Directory {:?} not found. Quitting.", dir);
-                std::process::exit(1);
+                exit(1);
             }
         } else {
             current_dir().unwrap()
@@ -134,7 +143,7 @@ impl App {
                     program,
                     args
                 ));
-                pb.enable_steady_tick(std::time::Duration::from_millis(20));
+                pb.enable_steady_tick(Duration::from_millis(20));
 
                 let mut child_process = Command::new(program);
                 for arg in args.split(' ') {
@@ -144,7 +153,7 @@ impl App {
                 let output = match child_process.output() {
                     Ok(output) => output,
                     Err(err) => {
-                        pb.set_style(indicatif::ProgressStyle::with_template("❗{msg}").unwrap());
+                        pb.set_style(WARNING_TEMPLATE.clone());
                         pb.tick();
                         pb.finish_with_message(format!(
                             "[{}/{}] Error: '{} {}' produced an Error: {}",
@@ -159,7 +168,7 @@ impl App {
                 };
 
                 if !output.status.success() {
-                    pb.set_style(indicatif::ProgressStyle::with_template("❗{msg}").unwrap());
+                    pb.set_style(WARNING_TEMPLATE.clone());
                     pb.tick();
                     pb.finish_with_message(format!(
                         "[{}/{}] Error: '{} {}' exited with {}: '{:?}'",
@@ -173,7 +182,7 @@ impl App {
                     continue;
                 }
 
-                pb.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+                pb.set_style(SUCCESS_TEMPLATE.clone());
                 pb.tick();
                 pb.finish_with_message(format!(
                     "[{}/{}] Done: '{} {}'",
@@ -187,7 +196,7 @@ impl App {
 
         let pb = ProgressBar::new_spinner();
         pb.set_message(format!("Connecting to '{}' via SSH", config.host));
-        pb.enable_steady_tick(std::time::Duration::from_millis(20));
+        pb.enable_steady_tick(Duration::from_millis(20));
 
         // Connect to SSH:
         let session = match runtime.block_on(session_builder.connect(&config.host)) {
@@ -195,7 +204,7 @@ impl App {
             Err(error) => panic!("Couldn't establish SSH connection: {:?}", error),
         };
 
-        pb.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+        pb.set_style(SUCCESS_TEMPLATE.clone());
         pb.tick();
         pb.finish_with_message(format!("Connected to '{}' via SSH", config.host));
 
@@ -212,12 +221,12 @@ impl App {
     }
 
     pub fn run(&mut self) {
-        let local_socket = openssh::Socket::TcpSocket(std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        let local_socket = TcpSocket(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             self.config.local_port,
         ));
-        let remote_socket = openssh::Socket::TcpSocket(std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        let remote_socket = TcpSocket(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             self.config.remote_port,
         ));
 
@@ -226,7 +235,7 @@ impl App {
             "Starting port-forward from local Port {} to remote Port {} via SSH",
             self.config.local_port, self.config.remote_port
         ));
-        pb.enable_steady_tick(std::time::Duration::from_millis(20));
+        pb.enable_steady_tick(Duration::from_millis(20));
 
         self.runtime
             .block_on(self.session.request_port_forward(
@@ -236,20 +245,20 @@ impl App {
             ))
             .unwrap();
 
-        pb.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+        pb.set_style(SUCCESS_TEMPLATE.clone());
         pb.tick();
         pb.finish_with_message(format!(
             "Started port-forward from local Port {} to remote Port {} via SSH",
             self.config.local_port, self.config.remote_port
         ));
 
-        let mp = indicatif::MultiProgress::new();
+        let mp = MultiProgress::new();
         let pb_forward = mp.add(ProgressBar::new_spinner());
         pb_forward.set_message(format!(
             "Forwarding local Port {} to remote Port {} via SSH",
             self.config.local_port, self.config.remote_port
         ));
-        pb_forward.enable_steady_tick(std::time::Duration::from_millis(20));
+        pb_forward.enable_steady_tick(Duration::from_millis(20));
 
         let pb_serve = mp.add(ProgressBar::new_spinner());
         pb_serve.set_message(format!(
@@ -257,7 +266,7 @@ impl App {
             self.directory.display(),
             self.config.local_port
         ));
-        pb_serve.enable_steady_tick(std::time::Duration::from_millis(20));
+        pb_serve.enable_steady_tick(Duration::from_millis(20));
 
         loop {
             if self.runtime.block_on(self.session.check()).is_err() {
@@ -265,43 +274,43 @@ impl App {
             };
 
             if self.should_end.load(Ordering::SeqCst) {
-                pb_forward.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+                pb_forward.set_style(SUCCESS_TEMPLATE.clone());
                 pb_forward.tick();
                 pb_forward.finish();
 
-                pb_serve.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+                pb_serve.set_style(SUCCESS_TEMPLATE.clone());
                 pb_serve.tick();
                 pb_serve.finish();
                 return;
             }
 
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            sleep(Duration::from_secs(1));
         }
     }
 
     pub fn close(self) {
-        let mp = indicatif::MultiProgress::new();
+        let mp = MultiProgress::new();
         let pb_close = mp.add(ProgressBar::new_spinner());
         pb_close.set_message("Closing livetunnel");
         pb_close.tick();
-        pb_close.enable_steady_tick(std::time::Duration::from_millis(20));
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        pb_close.enable_steady_tick(Duration::from_millis(20));
+        sleep(Duration::from_secs(1));
 
         let steps = 1;
 
         let pb_ssh = mp.add(ProgressBar::new_spinner());
         pb_ssh.set_message(format!("[{}/{}] Closing SSH connection", 1, steps));
         pb_ssh.tick();
-        pb_ssh.enable_steady_tick(std::time::Duration::from_millis(20));
+        pb_ssh.enable_steady_tick(Duration::from_millis(20));
 
         self.runtime.block_on(self.session.close()).unwrap();
 
-        pb_ssh.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+        pb_ssh.set_style(SUCCESS_TEMPLATE.clone());
         pb_ssh.tick();
         pb_ssh.finish_with_message(format!("[{}/{}] Closed SSH connection", 1, steps));
 
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        pb_close.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+        sleep(Duration::from_secs(1));
+        pb_close.set_style(SUCCESS_TEMPLATE.clone());
         pb_close.tick();
         pb_close.finish_with_message("Successfully closed livetunnel");
     }

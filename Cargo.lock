@@ -270,6 +270,7 @@ dependencies = [
  "ctrlc",
  "indicatif",
  "inquire",
+ "lazy_static",
  "openssh",
  "serde",
  "tokio",
