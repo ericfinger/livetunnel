@@ -13,6 +13,10 @@ use std::{
     fmt::{Display, Formatter, Result},
     path::PathBuf,
     process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -63,10 +67,11 @@ pub struct App {
     directory: PathBuf,
     runtime: Runtime,
     session: Session,
+    pub should_end: Arc<AtomicBool>,
 }
 
 impl App {
-    pub fn new(cli: Cli) -> Self {
+    pub fn new(cli: Cli, end: Arc<AtomicBool>) -> Self {
         let mut config = if cli.reconfigure
             || get_configuration_file_path("livetunnel", "livetunnel").is_err()
         {
@@ -139,11 +144,44 @@ impl App {
             directory,
             runtime,
             session,
+            should_end: end,
         }
     }
 
     pub fn run(&mut self) {
-        todo!()
+        let local_socket = openssh::Socket::TcpSocket(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            self.config.local_port,
+        ));
+        let remote_socket = openssh::Socket::TcpSocket(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            self.config.remote_port,
+        ));
+
+        self.runtime
+            .block_on(self.session.request_port_forward(
+                openssh::ForwardType::Remote,
+                remote_socket,
+                local_socket,
+            ))
+            .unwrap();
+
+        loop {
+            if self.runtime.block_on(self.session.check()).is_err() {
+                panic!("died");
+            };
+
+            if self.should_end.load(Ordering::SeqCst) {
+                return;
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    }
+
+    pub fn close(self) {
+        self.runtime.block_on(self.session.close()).unwrap();
+        println!("Cleaned up. Byyyyeeeee");
     }
 
     fn build_config() -> Config {

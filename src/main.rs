@@ -3,7 +3,13 @@ mod app;
 use crate::app::App;
 
 use clap::Parser;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -26,6 +32,17 @@ pub struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    let mut app = App::new(cli);
+
+    let end: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let end_app = end.clone();
+
+    ctrlc::set_handler(move || {
+        end.store(true, Ordering::Relaxed);
+    })
+    .unwrap();
+
+    let mut app = App::new(cli, end_app);
+
     app.run();
+    app.close();
 }
