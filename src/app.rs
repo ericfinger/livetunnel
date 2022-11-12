@@ -1,5 +1,7 @@
 use crate::Cli;
+
 use confy::{get_configuration_file_path, load, store};
+use indicatif::ProgressBar;
 use inquire::{
     validator::{Validation, ValueRequiredValidator},
     Confirm, CustomType, Editor, MultiSelect, Text,
@@ -60,7 +62,6 @@ impl Display for OptionalFeatures {
     }
 }
 
-#[allow(dead_code)]
 pub struct App {
     pub cli: Cli,
     config: Config,
@@ -75,12 +76,14 @@ impl App {
         let mut config = if cli.reconfigure
             || get_configuration_file_path("livetunnel", "livetunnel").is_err()
         {
+            println!("ℹ Starting setup assistant:");
             Self::build_config()
         } else {
             load("livetunnel", "livetunnel").unwrap()
         };
 
         if config.host.is_empty() {
+            println!("❗Config file Invalid, starting setup assistant:");
             config = Self::build_config();
         }
 
@@ -88,7 +91,8 @@ impl App {
             if dir.exists() {
                 dir
             } else {
-                panic!("Directory {:?} not found.", dir);
+                println!("❗Directory {:?} not found. Quitting.", dir);
+                std::process::exit(1);
             }
         } else {
             current_dir().unwrap()
@@ -115,26 +119,85 @@ impl App {
         }
 
         if let Some(ref commands) = config.before_commands {
-            for (program, args) in commands {
+            let num_cmds = commands.len();
+            println!(
+                "ℹ Running {} command(s) before establishing SSH connection",
+                num_cmds
+            );
+
+            for (i, (program, args)) in commands.iter().enumerate() {
+                let pb = ProgressBar::new_spinner();
+                pb.set_message(format!(
+                    "[{}/{}] Running '{} {}'",
+                    i + 1,
+                    num_cmds,
+                    program,
+                    args
+                ));
+                pb.enable_steady_tick(std::time::Duration::from_millis(20));
+
                 let mut child_process = Command::new(program);
                 for arg in args.split(' ') {
                     child_process.arg(arg);
                 }
-                let output = child_process.output().unwrap();
+
+                let output = match child_process.output() {
+                    Ok(output) => output,
+                    Err(err) => {
+                        pb.set_style(indicatif::ProgressStyle::with_template("❗{msg}").unwrap());
+                        pb.tick();
+                        pb.finish_with_message(format!(
+                            "[{}/{}] Error: '{} {}' produced an Error: {}",
+                            i + 1,
+                            num_cmds,
+                            program,
+                            args,
+                            err
+                        ));
+                        continue;
+                    }
+                };
+
                 if !output.status.success() {
-                    panic!(
-                        "Program '{}' exited with exit status {}: {:#?}",
-                        program, output.status, output
-                    );
+                    pb.set_style(indicatif::ProgressStyle::with_template("❗{msg}").unwrap());
+                    pb.tick();
+                    pb.finish_with_message(format!(
+                        "[{}/{}] Error: '{} {}' exited with {}: '{:?}'",
+                        i + 1,
+                        num_cmds,
+                        program,
+                        args,
+                        output.status,
+                        output
+                    ));
+                    continue;
                 }
+
+                pb.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+                pb.tick();
+                pb.finish_with_message(format!(
+                    "[{}/{}] Done: '{} {}'",
+                    i + 1,
+                    num_cmds,
+                    program,
+                    args
+                ));
             }
         }
+
+        let pb = ProgressBar::new_spinner();
+        pb.set_message(format!("Connecting to '{}' via SSH", config.host));
+        pb.enable_steady_tick(std::time::Duration::from_millis(20));
 
         // Connect to SSH:
         let session = match runtime.block_on(session_builder.connect(&config.host)) {
             Ok(session) => session,
             Err(error) => panic!("Couldn't establish SSH connection: {:?}", error),
         };
+
+        pb.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+        pb.tick();
+        pb.finish_with_message(format!("Connected to '{}' via SSH", config.host));
 
         // TODO: Execute after commands
 
@@ -158,6 +221,13 @@ impl App {
             self.config.remote_port,
         ));
 
+        let pb = ProgressBar::new_spinner();
+        pb.set_message(format!(
+            "Starting port-forward from local Port {} to remote Port {} via SSH",
+            self.config.local_port, self.config.remote_port
+        ));
+        pb.enable_steady_tick(std::time::Duration::from_millis(20));
+
         self.runtime
             .block_on(self.session.request_port_forward(
                 openssh::ForwardType::Remote,
@@ -166,22 +236,74 @@ impl App {
             ))
             .unwrap();
 
+        pb.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+        pb.tick();
+        pb.finish_with_message(format!(
+            "Started port-forward from local Port {} to remote Port {} via SSH",
+            self.config.local_port, self.config.remote_port
+        ));
+
+        let mp = indicatif::MultiProgress::new();
+        let pb_forward = mp.add(ProgressBar::new_spinner());
+        pb_forward.set_message(format!(
+            "Forwarding local Port {} to remote Port {} via SSH",
+            self.config.local_port, self.config.remote_port
+        ));
+        pb_forward.enable_steady_tick(std::time::Duration::from_millis(20));
+
+        let pb_serve = mp.add(ProgressBar::new_spinner());
+        pb_serve.set_message(format!(
+            "Serving content from '{}' on local Port '{}'",
+            self.directory.display(),
+            self.config.local_port
+        ));
+        pb_serve.enable_steady_tick(std::time::Duration::from_millis(20));
+
         loop {
             if self.runtime.block_on(self.session.check()).is_err() {
                 panic!("died");
             };
 
             if self.should_end.load(Ordering::SeqCst) {
+                pb_forward.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+                pb_forward.tick();
+                pb_forward.finish();
+
+                pb_serve.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+                pb_serve.tick();
+                pb_serve.finish();
                 return;
             }
 
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
 
     pub fn close(self) {
+        let mp = indicatif::MultiProgress::new();
+        let pb_close = mp.add(ProgressBar::new_spinner());
+        pb_close.set_message("Closing livetunnel");
+        pb_close.tick();
+        pb_close.enable_steady_tick(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let steps = 1;
+
+        let pb_ssh = mp.add(ProgressBar::new_spinner());
+        pb_ssh.set_message(format!("[{}/{}] Closing SSH connection", 1, steps));
+        pb_ssh.tick();
+        pb_ssh.enable_steady_tick(std::time::Duration::from_millis(20));
+
         self.runtime.block_on(self.session.close()).unwrap();
-        println!("Cleaned up. Byyyyeeeee");
+
+        pb_ssh.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+        pb_ssh.tick();
+        pb_ssh.finish_with_message(format!("[{}/{}] Closed SSH connection", 1, steps));
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        pb_close.set_style(indicatif::ProgressStyle::with_template("✓ {msg}").unwrap());
+        pb_close.tick();
+        pb_close.finish_with_message("Successfully closed livetunnel");
     }
 
     fn build_config() -> Config {
