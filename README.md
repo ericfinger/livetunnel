@@ -6,9 +6,10 @@ Inspired by [this Blogpost](https://igauravsehrawat.com/build-your-own-ngrok-4-e
 
 - Opens an SSH Tunnel to your server and forwards the necessary ports
   - Supports custom connect-commands (for port-knocking etc)
-- Provides a (local) webserver to serve your files over the tunnel
-- Allow to protect content with password (http basic_auth?)
-    (- Dynamically adds/removes users from .htaccess)?
+- Acts as a frontend to the excellent [miniserve](https://github.com/svenstaro/miniserve) to (optionally) serve local files
+    - Can serve files and websites
+    - Allows to protect content with username/password
+    - Allows uploads
 
 -------------------
 

@@ -12,6 +12,7 @@ use std::{
     env::current_dir,
     fmt::{Display, Formatter, Result},
     path::PathBuf,
+    process::Command,
 };
 
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -88,7 +89,6 @@ impl App {
             current_dir().unwrap()
         };
 
-        // TODO: Probably switch to thread pool
         let runtime = Runtime::new().unwrap();
 
         // Build SSH Connection from config:
@@ -109,7 +109,21 @@ impl App {
             session_builder.jump_hosts(jump_hosts);
         }
 
-        // TODO: Execute Before-Commands
+        if let Some(ref commands) = config.before_commands {
+            for (program, args) in commands {
+                let mut child_process = Command::new(program);
+                for arg in args.split(' ') {
+                    child_process.arg(arg);
+                }
+                let output = child_process.output().unwrap();
+                if !output.status.success() {
+                    panic!(
+                        "Program '{}' exited with exit status {}: {:#?}",
+                        program, output.status, output
+                    );
+                }
+            }
+        }
 
         // Connect to SSH:
         let session = match runtime.block_on(session_builder.connect(&config.host)) {
@@ -119,8 +133,6 @@ impl App {
 
         // TODO: Execute after commands
 
-        // TODO: Webserver
-
         App {
             cli,
             config,
@@ -128,6 +140,10 @@ impl App {
             runtime,
             session,
         }
+    }
+
+    pub fn run(&mut self) {
+        todo!()
     }
 
     fn build_config() -> Config {

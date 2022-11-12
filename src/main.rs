@@ -26,5 +26,6 @@ pub struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    let _app = App::new(cli);
+    let mut app = App::new(cli);
+    app.run();
 }
