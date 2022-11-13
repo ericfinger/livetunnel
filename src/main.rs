@@ -2,7 +2,6 @@ mod app;
 
 use crate::app::App;
 
-use clap::Parser;
 use std::{
     path::PathBuf,
     sync::{
@@ -10,6 +9,8 @@ use std::{
         Arc,
     },
 };
+
+use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -43,6 +44,6 @@ fn main() {
 
     let mut app = App::new(cli, end_app);
 
-    let open_handle = app.run();
-    app.close(open_handle);
+    app.run();
+    app.close();
 }

@@ -1,23 +1,11 @@
 use crate::Cli;
 
-use confy::{get_configuration_file_path, load, store};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use inquire::{
-    validator::{Validation, ValueRequiredValidator},
-    Confirm, CustomType, Editor, MultiSelect, Text, Password,
-};
-use lazy_static::lazy_static;
-use openssh::{Session, SessionBuilder, Socket::TcpSocket};
-use serde::{Deserialize, Serialize};
-use tokio::runtime::Runtime;
-use sha2::{Sha512, Digest};
-
 use std::{
     env::current_dir,
     fmt::{Display, Formatter, Result},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    process::{exit, Command, Child},
+    process::{exit, Child, Command},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -25,6 +13,18 @@ use std::{
     thread::sleep,
     time::Duration,
 };
+
+use confy::{get_configuration_file_path, load, store};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use inquire::{
+    validator::{Validation, ValueRequiredValidator},
+    Confirm, CustomType, Editor, MultiSelect, Password, Text,
+};
+use lazy_static::lazy_static;
+use openssh::{Session, SessionBuilder, Socket::TcpSocket};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
+use tokio::runtime::Runtime;
 
 lazy_static! {
     static ref INFO_TEMPLATE: ProgressStyle = ProgressStyle::with_template("ℹ {msg}").unwrap();
@@ -81,7 +81,8 @@ pub struct App {
     config: Config,
     directory: PathBuf,
     runtime: Runtime,
-    session: Session,
+    ssh_session: Session,
+    miniserve_handle: Option<Child>,
     pub should_end: Arc<AtomicBool>,
 }
 
@@ -115,21 +116,21 @@ impl App {
         let runtime = Runtime::new().unwrap();
 
         // Build SSH Connection from config:
-        let mut session_builder = SessionBuilder::default();
+        let mut ssh_session_builder = SessionBuilder::default();
         if let Some(port) = config.port {
-            session_builder.port(port);
+            ssh_session_builder.port(port);
         }
 
         if let Some(username) = config.username.clone() {
-            session_builder.user(username);
+            ssh_session_builder.user(username);
         }
 
         if let Some(keyfile) = &config.keyfile {
-            session_builder.keyfile(keyfile);
+            ssh_session_builder.keyfile(keyfile);
         }
 
         if let Some(jump_hosts) = &config.jump_hosts {
-            session_builder.jump_hosts(jump_hosts);
+            ssh_session_builder.jump_hosts(jump_hosts);
         }
 
         if let Some(ref commands) = config.before_commands {
@@ -204,8 +205,8 @@ impl App {
         pb.enable_steady_tick(Duration::from_millis(20));
 
         // Connect to SSH:
-        let session = match runtime.block_on(session_builder.connect(&config.host)) {
-            Ok(session) => session,
+        let ssh_session = match runtime.block_on(ssh_session_builder.connect(&config.host)) {
+            Ok(ssh_session) => ssh_session,
             Err(error) => panic!("Couldn't establish SSH connection: {:?}", error),
         };
 
@@ -220,28 +221,30 @@ impl App {
             config,
             directory,
             runtime,
-            session,
+            ssh_session,
+            miniserve_handle: None,
             should_end: end,
         }
     }
 
-    pub fn run(&mut self) -> Child {
-
+    pub fn run(&mut self) {
         if self.cli.secure {
             if self.config.users.is_empty() {
-                println!("ℹ Secure sharing selected, but no User(s) set in config. Please add one now:");
+                println!(
+                    "ℹ Secure sharing selected, but no User(s) set in config. Please add one now:"
+                );
                 self.config.users = App::add_users();
             } else {
-                let add_users = Confirm::new("ℹ Secure sharing selected. Do you want to add new users?")
-                    .with_default(false)
-                    .prompt()
-                    .unwrap();
+                let add_users =
+                    Confirm::new("ℹ Secure sharing selected. Do you want to add new users?")
+                        .with_default(false)
+                        .prompt()
+                        .unwrap();
 
                 if add_users {
                     let mut new_users = App::add_users();
                     self.config.users.append(&mut new_users);
                 }
-
             }
         }
 
@@ -262,7 +265,7 @@ impl App {
         ));
 
         self.runtime
-            .block_on(self.session.request_port_forward(
+            .block_on(self.ssh_session.request_port_forward(
                 openssh::ForwardType::Remote,
                 remote_socket,
                 local_socket,
@@ -302,7 +305,13 @@ impl App {
         // -H = show hidden files
         // -i = which network interface to use
         // -p port
-        miniserve.args(["-H", "-i", "127.0.0.1", "-p", &self.config.local_port.to_string()]);
+        miniserve.args([
+            "-H",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &self.config.local_port.to_string(),
+        ]);
 
         if self.cli.secure {
             for (user, pw) in &self.config.users {
@@ -312,12 +321,22 @@ impl App {
 
         miniserve.arg(&self.directory);
 
-        let mut miniserve_handle = match miniserve.spawn() {
-            Ok(handle) => handle,
-            Err(_err) => panic!("Couldn't spawn miniserve"),
+        self.miniserve_handle = match miniserve.spawn() {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                pb_serve.set_style(WARNING_TEMPLATE.clone());
+                pb_serve.tick();
+                pb_serve.finish_with_message(format!(
+                    "Could not start miniserve. Is it installed? Error: {}",
+                    err
+                ));
+                sleep(Duration::from_secs(1));
+                None
+            }
         };
 
-        pb_serve.set_message(format!("miniserve successfully started. Serving content from '{}' on local Port '{}'",
+        pb_serve.set_message(format!(
+            "miniserve successfully started. Serving content from '{}' on local Port '{}'",
             self.directory.display(),
             self.config.local_port
         ));
@@ -327,7 +346,7 @@ impl App {
         pb_exit_info.set_message("Press CTRL+C to exit");
 
         loop {
-            if self.runtime.block_on(self.session.check()).is_err() {
+            if self.runtime.block_on(self.ssh_session.check()).is_err() {
                 pb_forward.set_style(WARNING_TEMPLATE.clone());
                 pb_forward.tick();
                 pb_forward.finish_with_message("SSH Forward died! Closing livetunnel.");
@@ -335,22 +354,27 @@ impl App {
                 // TODO: Give option to reconnect
             };
 
-            match miniserve_handle.try_wait() {
-                Ok(status) => {
-                    if status.is_some() {
-                        if !status.unwrap().success() {
-                            pb_serve.set_style(WARNING_TEMPLATE.clone());
-                            pb_serve.tick();
-                            pb_serve.finish_with_message(format!("miniserve exited unexpectantly {:?}", status));
-                            // TODO: Give user option to restart/close
+            if let Some(miniserve_handle) = &mut self.miniserve_handle {
+                match miniserve_handle.try_wait() {
+                    Ok(status) => {
+                        if let Some(status) = status {
+                            if !status.success() {
+                                pb_serve.set_style(WARNING_TEMPLATE.clone());
+                                pb_serve.tick();
+                                pb_serve.finish_with_message(format!(
+                                    "miniserve exited unexpectantly {:?}",
+                                    status
+                                ));
+                                // TODO: Give user option to restart/close
+                            }
                         }
                     }
-                },
-                Err(err) => {
-                    pb_serve.set_style(WARNING_TEMPLATE.clone());
-                    pb_serve.tick();
-                    pb_serve.finish_with_message(format!("miniserve died: {err}"));
-                    // TODO: Give user option to restart/close
+                    Err(err) => {
+                        pb_serve.set_style(WARNING_TEMPLATE.clone());
+                        pb_serve.tick();
+                        pb_serve.finish_with_message(format!("miniserve died: {err}"));
+                        // TODO: Give user option to restart/close
+                    }
                 }
             }
 
@@ -365,14 +389,14 @@ impl App {
 
                 pb_exit_info.finish_and_clear();
 
-                return miniserve_handle;
+                return;
             }
 
             sleep(Duration::from_secs(1));
         }
     }
 
-    pub fn close(self, mut miniserve_handle: Child) {
+    pub fn close(mut self) {
         let mp = MultiProgress::new();
         let pb_close = mp.add(ProgressBar::new_spinner());
         pb_close.set_message("Closing livetunnel");
@@ -385,30 +409,35 @@ impl App {
         pb_ssh.set_message(format!("[{}/{}] Closing SSH connection", 1, steps));
         pb_ssh.enable_steady_tick(Duration::from_millis(20));
 
-        self.runtime.block_on(self.session.close()).unwrap();
+        self.runtime.block_on(self.ssh_session.close()).unwrap();
 
         pb_ssh.set_style(SUCCESS_TEMPLATE.clone());
         pb_ssh.tick();
         pb_ssh.finish_with_message(format!("[{}/{}] Closed SSH connection", 1, steps));
 
-        let pb_miniserve = mp.add(ProgressBar::new_spinner());
-        pb_miniserve.set_message(format!("[{}/{}] Closing miniserve", 2, steps));
-        pb_miniserve.enable_steady_tick(Duration::from_millis(20));
+        if let Some(miniserve_handle) = &mut self.miniserve_handle {
+            let pb_miniserve = mp.add(ProgressBar::new_spinner());
+            pb_miniserve.set_message(format!("[{}/{}] Closing miniserve", 2, steps));
+            pb_miniserve.enable_steady_tick(Duration::from_millis(20));
 
-        if miniserve_handle.kill().is_ok() {
-            // miniserve should already be killed by CTRL-C:
-            // https://unix.stackexchange.com/questions/149741/why-is-sigint-not-propagated-to-child-process-when-sent-to-its-parent-process/149756#149756
-            // TODO: Logging?
-        }
+            if miniserve_handle.kill().is_ok() {
+                // miniserve should already be killed by CTRL-C:
+                // https://unix.stackexchange.com/questions/149741/why-is-sigint-not-propagated-to-child-process-when-sent-to-its-parent-process/149756#149756
+                // TODO: Logging?
+            }
 
-        if let Err(err) = miniserve_handle.wait() {
-            pb_miniserve.set_style(WARNING_TEMPLATE.clone());
-            pb_miniserve.tick();
-            pb_miniserve.finish_with_message(format!("Could not close miniserve: {err}"));
-        } else {
-            pb_miniserve.set_style(SUCCESS_TEMPLATE.clone());
-            pb_miniserve.tick();
-            pb_miniserve.finish_with_message(format!("[{}/{}] Successfully exited miniserve", 2, steps));
+            if let Err(err) = miniserve_handle.wait() {
+                pb_miniserve.set_style(WARNING_TEMPLATE.clone());
+                pb_miniserve.tick();
+                pb_miniserve.finish_with_message(format!("Could not close miniserve: {err}"));
+            } else {
+                pb_miniserve.set_style(SUCCESS_TEMPLATE.clone());
+                pb_miniserve.tick();
+                pb_miniserve.finish_with_message(format!(
+                    "[{}/{}] Successfully exited miniserve",
+                    2, steps
+                ));
+            }
         }
 
         sleep(Duration::from_secs(1));
@@ -515,31 +544,7 @@ impl App {
 
         let mut users = Vec::new();
         if user_choice {
-            loop {
-                let mut hasher = Sha512::new();
-    
-                let user = Text::new("Username:")
-                    .with_validator(ValueRequiredValidator::default())
-                    .prompt()
-                    .unwrap();
-    
-                let password = Password::new("Password:")
-                    .with_validator(ValueRequiredValidator::default())
-                    .prompt()
-                    .unwrap();
-    
-                hasher.update(password);
-                users.push((String::from(user), format!("{:x}", hasher.finalize())));
-
-                let stop = Confirm::new("Do you want to add another User?")
-                    .with_default(false)
-                    .prompt()
-                    .unwrap();
-
-                if !stop {
-                    break;
-                }
-            }
+            users = Self::add_users();
         }
 
         let mut before_cmd: Vec<(String, String)> = vec![];
@@ -651,7 +656,7 @@ impl App {
                 .unwrap();
 
             hasher.update(password);
-            users.push((String::from(user), format!("{:x}", hasher.finalize_reset())));
+            users.push((user, format!("{:x}", hasher.finalize_reset())));
 
             let stop = Confirm::new("Do you want to add another User?")
                 .with_default(false)
