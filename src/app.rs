@@ -16,7 +16,7 @@ use std::{
     fmt::{Display, Formatter, Result},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    process::{exit, Command},
+    process::{exit, Command, Child},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -26,6 +26,7 @@ use std::{
 };
 
 lazy_static! {
+    static ref INFO_TEMPLATE: ProgressStyle = ProgressStyle::with_template("ℹ {msg}").unwrap();
     static ref WARNING_TEMPLATE: ProgressStyle = ProgressStyle::with_template("❗{msg}").unwrap();
     static ref SUCCESS_TEMPLATE: ProgressStyle = ProgressStyle::with_template("✓ {msg}").unwrap();
 }
@@ -220,7 +221,7 @@ impl App {
         }
     }
 
-    pub fn run(&mut self) {
+    pub fn run(&mut self) -> Child {
         let local_socket = TcpSocket(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             self.config.local_port,
@@ -262,16 +263,66 @@ impl App {
 
         let pb_serve = mp.add(ProgressBar::new_spinner());
         pb_serve.set_message(format!(
-            "Serving content from '{}' on local Port '{}'",
+            "Starting miniserve to serve content from '{}' on local Port '{}'",
             self.directory.display(),
             self.config.local_port
         ));
         pb_serve.enable_steady_tick(Duration::from_millis(20));
 
+        let mut miniserve = Command::new("miniserve");
+
+        // We don't care about miniserve's in-/output:
+        miniserve.stdin(std::process::Stdio::null());
+        miniserve.stdout(std::process::Stdio::null());
+
+        // -H = show hidden files
+        // -i = which network interface to use
+        // -W show wget command (testing)
+        // -p port
+        miniserve.args(["-H", "-W",  "-i", "127.0.0.1", "-p", &self.config.local_port.to_string()]);
+        miniserve.arg(&self.directory);
+
+        let mut miniserve_handle = match miniserve.spawn() {
+            Ok(handle) => handle,
+            Err(_err) => panic!("Couldn't spawn miniserve"),
+        };
+
+        pb_serve.set_message(format!("miniserve successfully started. Serving content from '{}' on local Port '{}'",
+            self.directory.display(),
+            self.config.local_port
+        ));
+
+        let pb_exit_info = mp.add(ProgressBar::new(42));
+        pb_exit_info.set_style(INFO_TEMPLATE.clone());
+        pb_exit_info.set_message("Press CTRL+C to exit");
+
         loop {
             if self.runtime.block_on(self.session.check()).is_err() {
-                panic!("died");
+                pb_forward.set_style(WARNING_TEMPLATE.clone());
+                pb_forward.tick();
+                pb_forward.finish_with_message("SSH Forward died! Closing livetunnel.");
+                self.should_end.store(true, Ordering::SeqCst);
+                // TODO: Give option to reconnect
             };
+
+            match miniserve_handle.try_wait() {
+                Ok(status) => {
+                    if status.is_some() {
+                        if !status.unwrap().success() {
+                            pb_serve.set_style(WARNING_TEMPLATE.clone());
+                            pb_serve.tick();
+                            pb_serve.finish_with_message(format!("miniserve exited unexpectantly {:?}", status));
+                            // TODO: Give user option to restart/close
+                        }
+                    }
+                },
+                Err(err) => {
+                    pb_serve.set_style(WARNING_TEMPLATE.clone());
+                    pb_serve.tick();
+                    pb_serve.finish_with_message(format!("miniserve died: {err}"));
+                    // TODO: Give user option to restart/close
+                }
+            }
 
             if self.should_end.load(Ordering::SeqCst) {
                 pb_forward.set_style(SUCCESS_TEMPLATE.clone());
@@ -281,26 +332,27 @@ impl App {
                 pb_serve.set_style(SUCCESS_TEMPLATE.clone());
                 pb_serve.tick();
                 pb_serve.finish();
-                return;
+
+                pb_exit_info.finish_and_clear();
+
+                return miniserve_handle;
             }
 
             sleep(Duration::from_secs(1));
         }
     }
 
-    pub fn close(self) {
+    pub fn close(self, mut miniserve_handle: Child) {
         let mp = MultiProgress::new();
         let pb_close = mp.add(ProgressBar::new_spinner());
         pb_close.set_message("Closing livetunnel");
-        pb_close.tick();
         pb_close.enable_steady_tick(Duration::from_millis(20));
         sleep(Duration::from_secs(1));
 
-        let steps = 1;
+        let steps = 2;
 
         let pb_ssh = mp.add(ProgressBar::new_spinner());
         pb_ssh.set_message(format!("[{}/{}] Closing SSH connection", 1, steps));
-        pb_ssh.tick();
         pb_ssh.enable_steady_tick(Duration::from_millis(20));
 
         self.runtime.block_on(self.session.close()).unwrap();
@@ -308,6 +360,26 @@ impl App {
         pb_ssh.set_style(SUCCESS_TEMPLATE.clone());
         pb_ssh.tick();
         pb_ssh.finish_with_message(format!("[{}/{}] Closed SSH connection", 1, steps));
+
+        let pb_miniserve = mp.add(ProgressBar::new_spinner());
+        pb_miniserve.set_message(format!("[{}/{}] Closing miniserve", 2, steps));
+        pb_miniserve.enable_steady_tick(Duration::from_millis(20));
+
+        if miniserve_handle.kill().is_ok() {
+            // miniserve should already be killed by CTRL-C:
+            // https://unix.stackexchange.com/questions/149741/why-is-sigint-not-propagated-to-child-process-when-sent-to-its-parent-process/149756#149756
+            // TODO: Logging?
+        }
+
+        if let Err(err) = miniserve_handle.wait() {
+            pb_miniserve.set_style(WARNING_TEMPLATE.clone());
+            pb_miniserve.tick();
+            pb_miniserve.finish_with_message(format!("Could not close miniserve: {err}"));
+        } else {
+            pb_miniserve.set_style(SUCCESS_TEMPLATE.clone());
+            pb_miniserve.tick();
+            pb_miniserve.finish_with_message(format!("[{}/{}] Successfully exited miniserve", 2, steps));
+        }
 
         sleep(Duration::from_secs(1));
         pb_close.set_style(SUCCESS_TEMPLATE.clone());

@@ -43,6 +43,6 @@ fn main() {
 
     let mut app = App::new(cli, end_app);
 
-    app.run();
-    app.close();
+    let open_handle = app.run();
+    app.close(open_handle);
 }
