@@ -4,12 +4,13 @@ use confy::{get_configuration_file_path, load, store};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::{
     validator::{Validation, ValueRequiredValidator},
-    Confirm, CustomType, Editor, MultiSelect, Text,
+    Confirm, CustomType, Editor, MultiSelect, Text, Password,
 };
 use lazy_static::lazy_static;
 use openssh::{Session, SessionBuilder, Socket::TcpSocket};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
+use sha2::{Sha512, Digest};
 
 use std::{
     env::current_dir,
@@ -48,6 +49,9 @@ struct Config {
     // Port forwards:
     local_port: u16,
     remote_port: u16,
+
+    // users for auth:
+    users: Vec<(String, String)>,
 }
 
 enum OptionalFeatures {
@@ -222,6 +226,32 @@ impl App {
     }
 
     pub fn run(&mut self) -> Child {
+
+        if self.cli.secure {
+            if self.config.users.is_empty() {
+                println!("ℹ Secure sharing selected, but no User(s) set in config. Please add one now:");
+                self.config.users = App::add_users();
+            } else {
+                let add_users = Confirm::new("ℹ Secure sharing selected. Do you want to add new users?")
+                    .with_default(false)
+                    .prompt()
+                    .unwrap();
+
+                if add_users {
+                    let mut new_users = App::add_users();
+                    self.config.users.append(&mut new_users);
+                }
+
+            }
+        }
+
+        let pb = ProgressBar::new_spinner();
+        pb.set_message(format!(
+            "Starting port-forward from local Port {} to remote Port {} via SSH",
+            self.config.local_port, self.config.remote_port
+        ));
+        pb.enable_steady_tick(Duration::from_millis(20));
+
         let local_socket = TcpSocket(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             self.config.local_port,
@@ -230,13 +260,6 @@ impl App {
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             self.config.remote_port,
         ));
-
-        let pb = ProgressBar::new_spinner();
-        pb.set_message(format!(
-            "Starting port-forward from local Port {} to remote Port {} via SSH",
-            self.config.local_port, self.config.remote_port
-        ));
-        pb.enable_steady_tick(Duration::from_millis(20));
 
         self.runtime
             .block_on(self.session.request_port_forward(
@@ -274,12 +297,19 @@ impl App {
         // We don't care about miniserve's in-/output:
         miniserve.stdin(std::process::Stdio::null());
         miniserve.stdout(std::process::Stdio::null());
+        miniserve.stderr(std::process::Stdio::null());
 
         // -H = show hidden files
         // -i = which network interface to use
-        // -W show wget command (testing)
         // -p port
-        miniserve.args(["-H", "-W",  "-i", "127.0.0.1", "-p", &self.config.local_port.to_string()]);
+        miniserve.args(["-H", "-i", "127.0.0.1", "-p", &self.config.local_port.to_string()]);
+
+        if self.cli.secure {
+            for (user, pw) in &self.config.users {
+                miniserve.args(["-a", &format!("{}:sha512:{}", user, pw)]);
+            }
+        }
+
         miniserve.arg(&self.directory);
 
         let mut miniserve_handle = match miniserve.spawn() {
@@ -445,7 +475,7 @@ impl App {
             .unwrap()
         {
             Some(
-                Text::new("SSH user:")
+                Text::new("SSH Keyfile:")
                     .with_validator(|input: &str| {
                         let path = PathBuf::from(input);
                         if path.exists() {
@@ -477,6 +507,40 @@ impl App {
             .with_error_message("Not a valid Port Number")
             .prompt()
             .unwrap();
+
+        let user_choice = Confirm::new("Do you want to add Users for secure sharing now? (You can always add users later when using the -s option)")
+            .with_default(false)
+            .prompt()
+            .unwrap();
+
+        let mut users = Vec::new();
+        if user_choice {
+            loop {
+                let mut hasher = Sha512::new();
+    
+                let user = Text::new("Username:")
+                    .with_validator(ValueRequiredValidator::default())
+                    .prompt()
+                    .unwrap();
+    
+                let password = Password::new("Password:")
+                    .with_validator(ValueRequiredValidator::default())
+                    .prompt()
+                    .unwrap();
+    
+                hasher.update(password);
+                users.push((String::from(user), format!("{:x}", hasher.finalize())));
+
+                let stop = Confirm::new("Do you want to add another User?")
+                    .with_default(false)
+                    .prompt()
+                    .unwrap();
+
+                if !stop {
+                    break;
+                }
+            }
+        }
 
         let mut before_cmd: Vec<(String, String)> = vec![];
         let mut after_cmd: Vec<(String, String)> = vec![];
@@ -563,10 +627,42 @@ impl App {
             },
             local_port,
             remote_port,
+            users,
         };
 
         store("livetunnel", "livetunnel", &config).unwrap();
 
         config
+    }
+
+    fn add_users() -> Vec<(String, String)> {
+        let mut hasher = Sha512::new();
+        let mut users = Vec::new();
+
+        loop {
+            let user = Text::new("Username:")
+                .with_validator(ValueRequiredValidator::default())
+                .prompt()
+                .unwrap();
+
+            let password = Password::new("Password:")
+                .with_validator(ValueRequiredValidator::default())
+                .prompt()
+                .unwrap();
+
+            hasher.update(password);
+            users.push((String::from(user), format!("{:x}", hasher.finalize_reset())));
+
+            let stop = Confirm::new("Do you want to add another User?")
+                .with_default(false)
+                .prompt()
+                .unwrap();
+
+            if !stop {
+                break;
+            }
+        }
+
+        users
     }
 }
