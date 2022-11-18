@@ -23,7 +23,7 @@ pub struct Cli {
     #[arg(long)]
     reconfigure: bool,
 
-    /// Set a password for the hosted site
+    /// Require credentials to access the hosted site
     #[arg(short, long)]
     secure: bool,
 
