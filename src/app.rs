@@ -214,7 +214,73 @@ impl App {
         pb.tick();
         pb.finish_with_message(format!("Connected to '{}' via SSH", config.host));
 
-        // TODO: Execute after commands
+        if let Some(ref commands) = config.after_commands {
+            let num_cmds = commands.len();
+            println!(
+                "ℹ Running {} command(s) on the newly establishing SSH connection",
+                num_cmds
+            );
+
+            for (i, (program, args)) in commands.iter().enumerate() {
+                let ac_pb = ProgressBar::new_spinner();
+                ac_pb.set_message(format!(
+                    "[{}/{}] Running '{} {}'",
+                    i + 1,
+                    num_cmds,
+                    program,
+                    args
+                ));
+                ac_pb.enable_steady_tick(Duration::from_millis(20));
+
+                let mut remote_cmd = ssh_session.command(program);
+                for arg in args.split(' ') {
+                    remote_cmd.arg(arg);
+                }
+
+                let output = match runtime.block_on(remote_cmd.output()) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        ac_pb.set_style(WARNING_TEMPLATE.clone());
+                        ac_pb.tick();
+                        ac_pb.finish_with_message(format!(
+                            "[{}/{}] Error: '{} {}' produced an Error: {}",
+                            i + 1,
+                            num_cmds,
+                            program,
+                            args,
+                            err
+                        ));
+                        continue;
+                    }
+                };
+
+                if !output.status.success() {
+                    ac_pb.set_style(WARNING_TEMPLATE.clone());
+                    ac_pb.tick();
+                    ac_pb.finish_with_message(format!(
+                        "[{}/{}] Error: '{} {}' exited with {}: '{:?}'",
+                        i + 1,
+                        num_cmds,
+                        program,
+                        args,
+                        output.status,
+                        output
+                    ));
+                    continue;
+                }
+
+                ac_pb.set_style(SUCCESS_TEMPLATE.clone());
+                ac_pb.tick();
+                ac_pb.finish_with_message(format!(
+                    "[{}/{}] Done: '{} {}': o: {}",
+                    i + 1,
+                    num_cmds,
+                    program,
+                    args,
+                    std::str::from_utf8(&output.stdout).unwrap(),
+                ));
+            }
+        }
 
         App {
             cli,
