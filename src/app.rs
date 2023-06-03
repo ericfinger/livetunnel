@@ -1,6 +1,7 @@
 use crate::Cli;
 
 use std::{
+    sync::OnceLock,
     env::current_dir,
     fmt::{Display, Formatter, Result},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -20,17 +21,15 @@ use inquire::{
     validator::{Validation, ValueRequiredValidator},
     Confirm, CustomType, Editor, MultiSelect, Password, Text,
 };
-use lazy_static::lazy_static;
+
 use openssh::{Session, SessionBuilder, Socket::TcpSocket};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use tokio::runtime::Runtime;
 
-lazy_static! {
-    static ref INFO_TEMPLATE: ProgressStyle = ProgressStyle::with_template("ℹ {msg}").unwrap();
-    static ref WARNING_TEMPLATE: ProgressStyle = ProgressStyle::with_template("❗{msg}").unwrap();
-    static ref SUCCESS_TEMPLATE: ProgressStyle = ProgressStyle::with_template("✓ {msg}").unwrap();
-}
+static INFO_TEMPLATE: OnceLock::<ProgressStyle> = OnceLock::new();
+static WARNING_TEMPLATE: OnceLock::<ProgressStyle> = OnceLock::new();
+static SUCCESS_TEMPLATE: OnceLock::<ProgressStyle> = OnceLock::new();
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 struct Config {
@@ -88,6 +87,10 @@ pub struct App {
 
 impl App {
     pub fn new(cli: Cli, end: Arc<AtomicBool>) -> Self {
+        let _ = INFO_TEMPLATE.set(ProgressStyle::with_template("ℹ {msg}").unwrap());
+        let _ = WARNING_TEMPLATE.set(ProgressStyle::with_template("❗ {msg}").unwrap());
+        let _ = SUCCESS_TEMPLATE.set(ProgressStyle::with_template("✓ {msg}").unwrap());
+
         let mut config = if cli.reconfigure
             || get_configuration_file_path("livetunnel", "livetunnel").is_err()
         {
@@ -159,7 +162,7 @@ impl App {
                 let output = match child_process.output() {
                     Ok(output) => output,
                     Err(err) => {
-                        pb.set_style(WARNING_TEMPLATE.clone());
+                        pb.set_style(WARNING_TEMPLATE.get().unwrap().clone());
                         pb.tick();
                         pb.finish_with_message(format!(
                             "[{}/{}] Error: '{} {}' produced an Error: {}",
@@ -174,7 +177,7 @@ impl App {
                 };
 
                 if !output.status.success() {
-                    pb.set_style(WARNING_TEMPLATE.clone());
+                    pb.set_style(WARNING_TEMPLATE.get().unwrap().clone());
                     pb.tick();
                     pb.finish_with_message(format!(
                         "[{}/{}] Error: '{} {}' exited with {}: '{:?}'",
@@ -188,7 +191,7 @@ impl App {
                     continue;
                 }
 
-                pb.set_style(SUCCESS_TEMPLATE.clone());
+                pb.set_style(SUCCESS_TEMPLATE.get().unwrap().clone());
                 pb.tick();
                 pb.finish_with_message(format!(
                     "[{}/{}] Done: '{} {}'",
@@ -210,7 +213,7 @@ impl App {
             Err(error) => panic!("Couldn't establish SSH connection: {:?}", error),
         };
 
-        pb.set_style(SUCCESS_TEMPLATE.clone());
+        pb.set_style(SUCCESS_TEMPLATE.get().unwrap().clone());
         pb.tick();
         pb.finish_with_message(format!("Connected to '{}' via SSH", config.host));
 
@@ -240,7 +243,7 @@ impl App {
                 let output = match runtime.block_on(remote_cmd.output()) {
                     Ok(output) => output,
                     Err(err) => {
-                        ac_pb.set_style(WARNING_TEMPLATE.clone());
+                        ac_pb.set_style(WARNING_TEMPLATE.get().unwrap().clone());
                         ac_pb.tick();
                         ac_pb.finish_with_message(format!(
                             "[{}/{}] Error: '{} {}' produced an Error: {}",
@@ -255,7 +258,7 @@ impl App {
                 };
 
                 if !output.status.success() {
-                    ac_pb.set_style(WARNING_TEMPLATE.clone());
+                    ac_pb.set_style(WARNING_TEMPLATE.get().unwrap().clone());
                     ac_pb.tick();
                     ac_pb.finish_with_message(format!(
                         "[{}/{}] Error: '{} {}' exited with {}: '{:?}'",
@@ -269,7 +272,7 @@ impl App {
                     continue;
                 }
 
-                ac_pb.set_style(SUCCESS_TEMPLATE.clone());
+                ac_pb.set_style(SUCCESS_TEMPLATE.get().unwrap().clone());
                 ac_pb.tick();
                 ac_pb.finish_with_message(format!(
                     "[{}/{}] Done: '{} {}': o: {}",
@@ -338,7 +341,7 @@ impl App {
             ))
             .unwrap();
 
-        pb.set_style(SUCCESS_TEMPLATE.clone());
+        pb.set_style(SUCCESS_TEMPLATE.get().unwrap().clone());
         pb.tick();
         pb.finish_with_message(format!(
             "Started port-forward from local Port {} to remote Port {} via SSH",
@@ -390,7 +393,7 @@ impl App {
         self.miniserve_handle = match miniserve.spawn() {
             Ok(handle) => Some(handle),
             Err(err) => {
-                pb_serve.set_style(WARNING_TEMPLATE.clone());
+                pb_serve.set_style(WARNING_TEMPLATE.get().unwrap().clone());
                 pb_serve.tick();
                 pb_serve.finish_with_message(format!(
                     "Could not start miniserve. Is it installed? Error: {}",
@@ -408,12 +411,12 @@ impl App {
         ));
 
         let pb_exit_info = mp.add(ProgressBar::new(42));
-        pb_exit_info.set_style(INFO_TEMPLATE.clone());
+        pb_exit_info.set_style(INFO_TEMPLATE.get().unwrap().clone());
         pb_exit_info.set_message("Press CTRL+C to exit");
 
         loop {
             if self.runtime.block_on(self.ssh_session.check()).is_err() {
-                pb_forward.set_style(WARNING_TEMPLATE.clone());
+                pb_forward.set_style(WARNING_TEMPLATE.get().unwrap().clone());
                 pb_forward.tick();
                 pb_forward.finish_with_message("SSH Forward died! Closing livetunnel.");
                 self.should_end.store(true, Ordering::SeqCst);
@@ -425,7 +428,7 @@ impl App {
                     Ok(status) => {
                         if let Some(status) = status {
                             if !status.success() {
-                                pb_serve.set_style(WARNING_TEMPLATE.clone());
+                                pb_serve.set_style(WARNING_TEMPLATE.get().unwrap().clone());
                                 pb_serve.tick();
                                 pb_serve.finish_with_message(format!(
                                     "miniserve exited unexpectantly {:?}",
@@ -436,7 +439,7 @@ impl App {
                         }
                     }
                     Err(err) => {
-                        pb_serve.set_style(WARNING_TEMPLATE.clone());
+                        pb_serve.set_style(WARNING_TEMPLATE.get().unwrap().clone());
                         pb_serve.tick();
                         pb_serve.finish_with_message(format!("miniserve died: {err}"));
                         // TODO: Give user option to restart/close
@@ -445,11 +448,11 @@ impl App {
             }
 
             if self.should_end.load(Ordering::SeqCst) {
-                pb_forward.set_style(SUCCESS_TEMPLATE.clone());
+                pb_forward.set_style(SUCCESS_TEMPLATE.get().unwrap().clone());
                 pb_forward.tick();
                 pb_forward.finish();
 
-                pb_serve.set_style(SUCCESS_TEMPLATE.clone());
+                pb_serve.set_style(SUCCESS_TEMPLATE.get().unwrap().clone());
                 pb_serve.tick();
                 pb_serve.finish();
 
@@ -477,7 +480,7 @@ impl App {
 
         self.runtime.block_on(self.ssh_session.close()).unwrap();
 
-        pb_ssh.set_style(SUCCESS_TEMPLATE.clone());
+        pb_ssh.set_style(SUCCESS_TEMPLATE.get().unwrap().clone());
         pb_ssh.tick();
         pb_ssh.finish_with_message(format!("[{}/{}] Closed SSH connection", 1, steps));
 
@@ -493,11 +496,11 @@ impl App {
             }
 
             if let Err(err) = miniserve_handle.wait() {
-                pb_miniserve.set_style(WARNING_TEMPLATE.clone());
+                pb_miniserve.set_style(WARNING_TEMPLATE.get().unwrap().clone());
                 pb_miniserve.tick();
                 pb_miniserve.finish_with_message(format!("Could not close miniserve: {err}"));
             } else {
-                pb_miniserve.set_style(SUCCESS_TEMPLATE.clone());
+                pb_miniserve.set_style(SUCCESS_TEMPLATE.get().unwrap().clone());
                 pb_miniserve.tick();
                 pb_miniserve.finish_with_message(format!(
                     "[{}/{}] Successfully exited miniserve",
@@ -507,7 +510,7 @@ impl App {
         }
 
         sleep(Duration::from_secs(1));
-        pb_close.set_style(SUCCESS_TEMPLATE.clone());
+        pb_close.set_style(SUCCESS_TEMPLATE.get().unwrap().clone());
         pb_close.tick();
         pb_close.finish_with_message("Successfully closed livetunnel");
     }
